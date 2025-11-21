@@ -68,11 +68,6 @@ struct FileEntry {
     is_dir: bool,
 }
 
-struct SearchResult {
-    entry: FileEntry,
-    full_path: String,
-}
-
 enum AppState {
     Initializing,
     Scanning { count: u64, start_time: Instant },
@@ -84,7 +79,7 @@ struct DeepSearchApp {
     state: AppState,
     file_data: Arc<Vec<FileEntry>>, // Read-only after scan
     search_query: String,
-    search_results: Vec<SearchResult>,
+    search_results: Vec<FileEntry>,
     search_stats: Option<(usize, Duration)>,
     
     // Communication
@@ -153,22 +148,11 @@ impl DeepSearchApp {
         // Parallel search for speed
         let results: Vec<FileEntry> = data.par_iter()
             .filter(|entry| entry.name.to_lowercase().contains(&query))
-            .collect::<Vec<_>>() // Collect all matches first
-            .into_iter()
-            .take(100) // Limit results for UI performance
             .cloned()
             .collect();
 
-        // Resolve paths for the results
-        self.search_results = results.into_iter().map(|entry| {
-            let full_path = resolve_path(entry.id, data);
-            SearchResult {
-                entry,
-                full_path,
-            }
-        }).collect();
-
-        self.search_stats = Some((self.search_results.len(), start.elapsed()));
+        self.search_stats = Some((results.len(), start.elapsed()));
+        self.search_results = results;
     }
 }
 
@@ -261,37 +245,47 @@ impl eframe::App for DeepSearchApp {
                     ui.add_space(10.0);
                     ui.separator();
 
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        ui.add_space(10.0);
-                        egui::Grid::new("results_grid")
-                            .num_columns(2)
-                            .spacing([10.0, 10.0])
-                            .striped(true)
-                            .show(ui, |ui| {
-                                for res in &self.search_results {
-                                    // Icon & Name
-                                    ui.horizontal(|ui| {
-                                        ui.add_space(10.0);
-                                        let icon = if res.entry.is_dir { "📁" } else { "📄" };
-                                        ui.label(icon);
-                                        if ui.link(&res.entry.name).clicked() {
-                                            open_in_explorer(&res.full_path);
-                                        }
-                                    });
+                    egui::ScrollArea::vertical().show_rows(
+                        ui,
+                        20.0, // Estimated row height
+                        self.search_results.len(),
+                        |ui, row_range| {
+                            egui::Grid::new("results_grid")
+                                .num_columns(2)
+                                .spacing([10.0, 10.0])
+                                .striped(true)
+                                .min_col_width(200.0) // Ensure name column has some width
+                                .show(ui, |ui| {
+                                    for i in row_range {
+                                        if let Some(entry) = self.search_results.get(i) {
+                                            // Resolve path on the fly for visible rows
+                                            let full_path = resolve_path(entry.id, &self.file_data);
+                                            
+                                            // Icon & Name
+                                            ui.horizontal(|ui| {
+                                                ui.add_space(10.0);
+                                                let icon = if entry.is_dir { "📁" } else { "📄" };
+                                                ui.label(icon);
+                                                if ui.link(&entry.name).clicked() {
+                                                    open_in_explorer(&full_path);
+                                                }
+                                            });
 
-                                    // Path
-                                    ui.label(egui::RichText::new(&res.full_path).size(10.0).color(egui::Color32::GRAY));
-                                    ui.end_row();
-                                }
-                            });
+                                            // Path
+                                            ui.label(egui::RichText::new(&full_path).size(10.0).color(egui::Color32::GRAY));
+                                            ui.end_row();
+                                        }
+                                    }
+                                });
+                        },
+                    );
                         
-                        if self.search_results.is_empty() && !self.search_query.is_empty() {
-                            ui.vertical_centered(|ui| {
-                                ui.add_space(20.0);
-                                ui.label("No results found.");
-                            });
-                        }
-                    });
+                    if self.search_results.is_empty() && !self.search_query.is_empty() {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(20.0);
+                            ui.label("No results found.");
+                        });
+                    }
                 }
             }
         });
