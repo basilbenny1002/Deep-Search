@@ -4,6 +4,7 @@ use eframe::egui;
 use rayon::prelude::*;
 use std::ffi::c_void;
 use std::mem::size_of;
+use std::os::windows::process::CommandExt;
 use std::ptr;
 use std::sync::Arc;
 use std::thread;
@@ -15,8 +16,6 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::System::Ioctl::{FSCTL_ENUM_USN_DATA, FSCTL_QUERY_USN_JOURNAL};
-use windows::Win32::UI::Shell::ShellExecuteA;
-use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 // --- RAW NTFS STRUCTURES ---
 #[repr(C)]
@@ -89,6 +88,10 @@ struct DeepSearchApp {
     tx_data: crossbeam_channel::Sender<Vec<FileEntry>>,
     rx_error: crossbeam_channel::Receiver<String>,
     tx_error: crossbeam_channel::Sender<String>,
+    
+    // Search Async
+    rx_search: crossbeam_channel::Receiver<(String, Vec<FileEntry>, Duration)>,
+    tx_search: crossbeam_channel::Sender<(String, Vec<FileEntry>, Duration)>,
 }
 
 impl DeepSearchApp {
@@ -96,6 +99,7 @@ impl DeepSearchApp {
         let (tx_progress, rx_progress) = crossbeam_channel::unbounded();
         let (tx_data, rx_data) = crossbeam_channel::bounded(1);
         let (tx_error, rx_error) = crossbeam_channel::bounded(1);
+        let (tx_search, rx_search) = crossbeam_channel::unbounded();
 
         Self {
             state: AppState::Initializing,
@@ -109,6 +113,8 @@ impl DeepSearchApp {
             tx_data,
             rx_error,
             tx_error,
+            rx_search,
+            tx_search,
         }
     }
 
@@ -135,24 +141,28 @@ impl DeepSearchApp {
     }
 
     fn perform_search(&mut self) {
-        if self.search_query.is_empty() {
+        let query = self.search_query.clone();
+        if query.is_empty() {
             self.search_results.clear();
             self.search_stats = None;
             return;
         }
 
-        let start = Instant::now();
-        let query = self.search_query.to_lowercase();
-        let data = &self.file_data;
+        let data = self.file_data.clone();
+        let tx = self.tx_search.clone();
 
-        // Parallel search for speed
-        let results: Vec<FileEntry> = data.par_iter()
-            .filter(|entry| entry.name.to_lowercase().contains(&query))
-            .cloned()
-            .collect();
-
-        self.search_stats = Some((results.len(), start.elapsed()));
-        self.search_results = results;
+        // Spawn a thread to avoid blocking the UI
+        thread::spawn(move || {
+            let start = Instant::now();
+            let q_lower = query.to_lowercase();
+            
+            let results: Vec<FileEntry> = data.par_iter()
+                .filter(|entry| entry.name.to_lowercase().starts_with(&q_lower))
+                .cloned()
+                .collect();
+            
+            let _ = tx.send((query, results, start.elapsed()));
+        });
     }
 }
 
@@ -166,7 +176,7 @@ impl eframe::App for DeepSearchApp {
         ctx.set_visuals(visuals);
 
         // Handle async messages
-        if let Ok(count) = self.rx_progress.try_recv() {
+        while let Ok(count) = self.rx_progress.try_recv() {
             if let AppState::Scanning { count: ref mut c, .. } = self.state {
                 *c = count;
             }
@@ -177,6 +187,15 @@ impl eframe::App for DeepSearchApp {
         }
         if let Ok(err) = self.rx_error.try_recv() {
             self.state = AppState::Error(err);
+        }
+        
+        // Handle search results
+        while let Ok((query, results, duration)) = self.rx_search.try_recv() {
+            // Only update if the result matches the current query (ignore old results)
+            if query == self.search_query {
+                self.search_stats = Some((results.len(), duration));
+                self.search_results = results;
+            }
         }
 
         // Auto-start scan on first frame
@@ -294,7 +313,9 @@ impl eframe::App for DeepSearchApp {
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([800.0, 600.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([800.0, 600.0]),
+        vsync: true, // Enable VSync to fix flickering
         ..Default::default()
     };
     eframe::run_native(
@@ -351,8 +372,8 @@ fn scan_mft_worker(tx: crossbeam_channel::Sender<u64>) -> Result<Vec<FileEntry>,
         high_usn: journal_data.max_usn,
     };
 
-    let mut buffer = vec![0u8; 65536]; 
-    let mut entries = Vec::with_capacity(500_000); // Pre-allocate some space
+    let mut buffer = vec![0u8; 65536]; // 64KB Buffer for smooth UI updates
+    let mut entries = Vec::with_capacity(500_000); 
     let mut total_count = 0;
 
     loop {
@@ -399,8 +420,8 @@ fn scan_mft_worker(tx: crossbeam_channel::Sender<u64>) -> Result<Vec<FileEntry>,
             offset += p_record.record_length as usize;
         }
 
-        // Report progress every ~10k files
-        if total_count % 10_000 == 0 {
+        // Report progress every ~1k files for smoother UI updates
+        if total_count % 1_000 == 0 {
             let _ = tx.send(total_count);
         }
 
@@ -423,41 +444,41 @@ fn resolve_path(mut current_id: u64, data: &[FileEntry]) -> String {
         // Binary search for the current ID
         if let Ok(idx) = data.binary_search_by_key(&current_id, |e| e.id) {
             let entry = &data[idx];
-            parts.push(entry.name.clone());
 
-            if entry.parent_id == current_id || safety > 50 {
-                break; // Root or cycle
+            // Stop at root (parent points to self)
+            if entry.parent_id == current_id {
+                break;
+            }
+
+            if entry.name != "." && entry.name != ".." {
+                parts.push(entry.name.clone());
             }
             current_id = entry.parent_id;
+            
             safety += 1;
+            if safety > 200 { break; } // Cycle/Depth protection
         } else {
-            parts.push("?".to_string());
+            // If we can't find the parent, we assume we've reached the root.
+            // We stop here to avoid generating invalid paths like C:\?\Users\...
             break;
         }
     }
     parts.reverse();
     let path = parts.join("\\");
-    if !path.starts_with("C:") {
-        format!("C:{}", path)
-    } else {
-        path
-    }
+    format!("C:\\{}", path)
 }
 
 fn open_in_explorer(path: &str) {
-    // Use "explorer /select,path" to highlight the file
-    let cmd = format!("/select,\"{}\"\0", path);
-    let operation = "open\0";
-    let file = "explorer.exe\0";
+    println!("Attempting to open: {}", path);
     
-    unsafe {
-        ShellExecuteA(
-            windows::Win32::Foundation::HWND(ptr::null_mut()),
-            PCSTR(operation.as_ptr()),
-            PCSTR(file.as_ptr()),
-            PCSTR(cmd.as_ptr()),
-            PCSTR(ptr::null()),
-            SW_SHOWNORMAL,
-        );
+    if !std::path::Path::new(path).exists() {
+        eprintln!("File does not exist: {}", path);
+        return;
     }
+
+    // Use CommandExt::raw_arg to pass the argument exactly as is
+    // This avoids Rust's automatic quoting which can confuse explorer's /select switch
+    let _ = std::process::Command::new("explorer")
+        .raw_arg(format!("/select,\"{}\"", path))
+        .spawn();
 }
