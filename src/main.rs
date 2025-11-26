@@ -262,14 +262,16 @@ impl eframe::App for DeepSearchApp {
 
                     // Stats
                     if let Some((count, duration)) = self.search_stats {
-                        ui.horizontal(|ui| {
-                            ui.add_space(25.0);
-                            ui.label(egui::RichText::new(format!(
-                                "Found {} results in {:.3}s", 
-                                count, 
-                                duration.as_secs_f32()
-                            )).size(12.0).color(egui::Color32::GRAY));
-                        });
+                        if count > 0 {
+                            ui.horizontal(|ui| {
+                                ui.add_space(25.0);
+                                ui.label(egui::RichText::new(format!(
+                                    "Found {} results in {:.3}s", 
+                                    count, 
+                                    duration.as_secs_f32()
+                                )).size(12.0).color(egui::Color32::GRAY));
+                            });
+                        }
                     }
 
                     ui.add_space(10.0);
