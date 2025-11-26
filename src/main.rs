@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // Hide console in release
 
+// NEcessary imports
 use eframe::egui;
 use rayon::prelude::*;
 use std::ffi::c_void;
@@ -12,8 +13,10 @@ use std::time::{Duration, Instant};
 use windows::core::PCSTR;
 use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileA, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    CreateFileA, GetLogicalDrives, GetDriveTypeA, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
+
+const DRIVE_FIXED: u32 = 3;
 use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::System::Ioctl::{FSCTL_ENUM_USN_DATA, FSCTL_QUERY_USN_JOURNAL};
 
@@ -65,11 +68,12 @@ struct FileEntry {
     parent_id: u64,
     name: String,
     is_dir: bool,
+    drive_idx: u8,
 }
 
 enum AppState {
     Initializing,
-    Scanning { count: u64, start_time: Instant },
+    Scanning { count: u64, current_drive: String, start_time: Instant },
     Ready,
     Error(String),
 }
@@ -77,15 +81,16 @@ enum AppState {
 struct DeepSearchApp {
     state: AppState,
     file_data: Arc<Vec<FileEntry>>, // Read-only after scan
+    drives: Arc<Vec<String>>,
     search_query: String,
     search_results: Vec<FileEntry>,
     search_stats: Option<(usize, Duration)>,
     
     // Communication
-    rx_progress: crossbeam_channel::Receiver<u64>,
-    tx_progress: crossbeam_channel::Sender<u64>,
-    rx_data: crossbeam_channel::Receiver<Vec<FileEntry>>,
-    tx_data: crossbeam_channel::Sender<Vec<FileEntry>>,
+    rx_progress: crossbeam_channel::Receiver<(u64, String)>,
+    tx_progress: crossbeam_channel::Sender<(u64, String)>,
+    rx_data: crossbeam_channel::Receiver<(Vec<FileEntry>, Vec<String>)>,
+    tx_data: crossbeam_channel::Sender<(Vec<FileEntry>, Vec<String>)>,
     rx_error: crossbeam_channel::Receiver<String>,
     tx_error: crossbeam_channel::Sender<String>,
     
@@ -104,6 +109,7 @@ impl DeepSearchApp {
         Self {
             state: AppState::Initializing,
             file_data: Arc::new(Vec::new()),
+            drives: Arc::new(Vec::new()),
             search_query: String::new(),
             search_results: Vec::new(),
             search_stats: None,
@@ -121,6 +127,7 @@ impl DeepSearchApp {
     fn start_scan(&mut self) {
         self.state = AppState::Scanning { 
             count: 0, 
+            current_drive: "Detecting drives...".to_string(),
             start_time: Instant::now() 
         };
 
@@ -129,9 +136,9 @@ impl DeepSearchApp {
         let tx_error = self.tx_error.clone();
 
         thread::spawn(move || {
-            match scan_mft_worker(tx_progress) {
-                Ok(data) => {
-                    let _ = tx_data.send(data);
+            match scan_all_drives(tx_progress) {
+                Ok((data, drives)) => {
+                    let _ = tx_data.send((data, drives));
                 }
                 Err(e) => {
                     let _ = tx_error.send(e);
@@ -176,13 +183,15 @@ impl eframe::App for DeepSearchApp {
         ctx.set_visuals(visuals);
 
         // Handle async messages
-        while let Ok(count) = self.rx_progress.try_recv() {
-            if let AppState::Scanning { count: ref mut c, .. } = self.state {
+        while let Ok((count, current_drive)) = self.rx_progress.try_recv() {
+            if let AppState::Scanning { count: ref mut c, current_drive: ref mut d, .. } = self.state {
                 *c = count;
+                *d = current_drive;
             }
         }
-        if let Ok(data) = self.rx_data.try_recv() {
+        if let Ok((data, drives)) = self.rx_data.try_recv() {
             self.file_data = Arc::new(data);
+            self.drives = Arc::new(drives);
             self.state = AppState::Ready;
         }
         if let Ok(err) = self.rx_error.try_recv() {
@@ -209,10 +218,12 @@ impl eframe::App for DeepSearchApp {
                     ui.spinner();
                     ui.label("Initializing...");
                 }
-                AppState::Scanning { count, start_time } => {
+                AppState::Scanning { count, current_drive, start_time } => {
                     ui.vertical_centered(|ui| {
                         ui.add_space(50.0);
                         ui.heading("Indexing MFT...");
+                        ui.add_space(10.0);
+                        ui.label(current_drive);
                         ui.add_space(20.0);
                         ui.spinner();
                         ui.add_space(20.0);
@@ -278,7 +289,7 @@ impl eframe::App for DeepSearchApp {
                                     for i in row_range {
                                         if let Some(entry) = self.search_results.get(i) {
                                             // Resolve path on the fly for visible rows
-                                            let full_path = resolve_path(entry.id, &self.file_data);
+                                            let full_path = resolve_path(entry, &self.file_data, &self.drives);
                                             
                                             // Icon & Name
                                             ui.horizontal(|ui| {
@@ -327,8 +338,65 @@ fn main() -> eframe::Result<()> {
 
 // --- WORKER LOGIC ---
 
-fn scan_mft_worker(tx: crossbeam_channel::Sender<u64>) -> Result<Vec<FileEntry>, String> {
-    let volume_path = "\\\\.\\C:\0";
+fn get_drives() -> Vec<String> {
+    let mut drives = Vec::new();
+    let bitmask = unsafe { GetLogicalDrives() };
+    
+    for i in 0..26 {
+        if (bitmask & (1 << i)) != 0 {
+            let drive_letter = (b'A' + i) as char;
+            let path = format!("{}:\\\0", drive_letter);
+            
+            let drive_type = unsafe { 
+                GetDriveTypeA(PCSTR(path.as_ptr())) 
+            };
+
+            if drive_type == DRIVE_FIXED {
+                drives.push(format!("{}:", drive_letter));
+            }
+        }
+    }
+    drives
+}
+
+fn scan_all_drives(
+    tx_progress: crossbeam_channel::Sender<(u64, String)>
+) -> Result<(Vec<FileEntry>, Vec<String>), String> {
+    let drives = get_drives();
+    let mut all_entries = Vec::new();
+    let mut total_count = 0;
+
+    if drives.is_empty() {
+        return Err("No fixed drives found.".to_string());
+    }
+
+    for (idx, drive) in drives.iter().enumerate() {
+        let _ = tx_progress.send((total_count, format!("Scanning {}...", drive)));
+        
+        // We ignore errors for individual drives so one bad drive doesn't stop everything
+        // But if ALL fail, we might want to know.
+        match scan_drive(drive, idx as u8, &tx_progress, &mut total_count) {
+            Ok(entries) => all_entries.extend(entries),
+            Err(e) => eprintln!("Failed to scan {}: {}", drive, e),
+        }
+    }
+    
+    // Sort by (drive_idx, id) to enable binary search for parent resolution
+    // This is CRITICAL for resolve_path to work correctly across multiple drives
+    all_entries.par_sort_unstable_by(|a, b| {
+        a.drive_idx.cmp(&b.drive_idx).then(a.id.cmp(&b.id))
+    });
+
+    Ok((all_entries, drives))
+}
+
+fn scan_drive(
+    drive_letter: &str, 
+    drive_idx: u8,
+    tx: &crossbeam_channel::Sender<(u64, String)>,
+    total_count: &mut u64
+) -> Result<Vec<FileEntry>, String> {
+    let volume_path = format!("\\\\.\\{}\0", drive_letter);
     
     let handle = unsafe {
         CreateFileA(
@@ -343,7 +411,7 @@ fn scan_mft_worker(tx: crossbeam_channel::Sender<u64>) -> Result<Vec<FileEntry>,
     };
 
     if handle == Ok(INVALID_HANDLE_VALUE) || handle.is_err() {
-        return Err("Access Denied. Run as Administrator.".to_string());
+        return Err(format!("Access Denied to {}. Run as Administrator.", drive_letter));
     }
     let handle = handle.unwrap();
 
@@ -363,7 +431,7 @@ fn scan_mft_worker(tx: crossbeam_channel::Sender<u64>) -> Result<Vec<FileEntry>,
     };
 
     if success.is_err() {
-        return Err("Failed to query USN Journal.".to_string());
+        return Err(format!("Failed to query USN Journal on {}.", drive_letter));
     }
 
     let mut med = MftEnumData {
@@ -372,9 +440,8 @@ fn scan_mft_worker(tx: crossbeam_channel::Sender<u64>) -> Result<Vec<FileEntry>,
         high_usn: journal_data.max_usn,
     };
 
-    let mut buffer = vec![0u8; 65536]; // 64KB Buffer for smooth UI updates
-    let mut entries = Vec::with_capacity(500_000); 
-    let mut total_count = 0;
+    let mut buffer = vec![0u8; 65536]; // 64KB Buffer
+    let mut entries = Vec::with_capacity(100_000); 
 
     loop {
         let success = unsafe {
@@ -413,16 +480,17 @@ fn scan_mft_worker(tx: crossbeam_channel::Sender<u64>) -> Result<Vec<FileEntry>,
                     parent_id: p_record.parent_file_reference_number,
                     name,
                     is_dir,
+                    drive_idx,
                 });
 
-                total_count += 1;
+                *total_count += 1;
             }
             offset += p_record.record_length as usize;
         }
 
-        // Report progress every ~1k files for smoother UI updates
-        if total_count % 1_000 == 0 {
-            let _ = tx.send(total_count);
+        // Report progress every ~2k files
+        if *total_count % 2_000 == 0 {
+            let _ = tx.send((*total_count, format!("Scanning {}...", drive_letter)));
         }
 
         med.start_file_reference_number = unsafe { ptr::read(buffer.as_ptr() as *const u64) };
@@ -430,42 +498,51 @@ fn scan_mft_worker(tx: crossbeam_channel::Sender<u64>) -> Result<Vec<FileEntry>,
 
     unsafe { windows::Win32::Foundation::CloseHandle(handle) };
 
-    // Sort by ID to enable binary search for parent resolution
-    entries.par_sort_unstable_by_key(|e| e.id);
-
     Ok(entries)
 }
 
-fn resolve_path(mut current_id: u64, data: &[FileEntry]) -> String {
+fn resolve_path(entry: &FileEntry, data: &[FileEntry], drives: &[String]) -> String {
     let mut parts = Vec::new();
+    let mut current_id = entry.id;
+    let drive_idx = entry.drive_idx;
     let mut safety = 0;
 
     loop {
-        // Binary search for the current ID
-        if let Ok(idx) = data.binary_search_by_key(&current_id, |e| e.id) {
-            let entry = &data[idx];
+        // Binary search for (drive_idx, current_id)
+        // Since data is sorted by drive_idx then id, we can find the exact entry
+        let result = data.binary_search_by(|e| {
+            e.drive_idx.cmp(&drive_idx).then(e.id.cmp(&current_id))
+        });
+
+        if let Ok(idx) = result {
+            let e = &data[idx];
 
             // Stop at root (parent points to self)
-            if entry.parent_id == current_id {
+            if e.parent_id == current_id {
                 break;
             }
 
-            if entry.name != "." && entry.name != ".." {
-                parts.push(entry.name.clone());
+            if e.name != "." && e.name != ".." {
+                parts.push(e.name.clone());
             }
-            current_id = entry.parent_id;
+            current_id = e.parent_id;
             
             safety += 1;
             if safety > 200 { break; } // Cycle/Depth protection
         } else {
             // If we can't find the parent, we assume we've reached the root.
-            // We stop here to avoid generating invalid paths like C:\?\Users\...
             break;
         }
     }
     parts.reverse();
     let path = parts.join("\\");
-    format!("C:\\{}", path)
+    
+    // Prepend the correct drive letter
+    if let Some(drive) = drives.get(drive_idx as usize) {
+        format!("{}\\{}", drive, path)
+    } else {
+        format!("?\\{}", path) // Fallback
+    }
 }
 
 fn open_in_explorer(path: &str) {
