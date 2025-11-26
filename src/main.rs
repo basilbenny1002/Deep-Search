@@ -20,9 +20,11 @@ const DRIVE_FIXED: u32 = 3;
 use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::System::Ioctl::{FSCTL_ENUM_USN_DATA, FSCTL_QUERY_USN_JOURNAL};
 
-// --- RAW NTFS STRUCTURES ---
-#[repr(C)]
-#[derive(Debug, Default)]
+// --- RAW NTFS STRUCTURES --- for storing the values read from teh MFT table
+
+//Similar to the USN_JOURNAL_DATA_V0 structure in C
+#[repr(C)] // Tells rust compiler to use C-style memory layout
+#[derive(Debug, Default)] // Can be printed with {:?} and has a default constructor
 struct UsnJournalData {
     usn_journal_id: u64,
     first_usn: i64,
@@ -33,6 +35,7 @@ struct UsnJournalData {
     allocation_delta: u64,
 }
 
+// Similar to the MFT_ENUM_DATA structure in C
 #[repr(C)]
 struct MftEnumData {
     start_file_reference_number: u64,
@@ -40,6 +43,7 @@ struct MftEnumData {
     high_usn: i64,
 }
 
+ // Similar to the USN_RECORD structure in C
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct UsnRecordHeader {
@@ -58,10 +62,11 @@ struct UsnRecordHeader {
     file_name_offset: u16,
 }
 
-const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x00000010;
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x00000010; // A bitmask indicating a directory
 
 // --- APP DATA STRUCTURES ---
-
+ 
+// Represents a single file or directory entry in the MFT
 #[derive(Clone, Debug)]
 struct FileEntry {
     id: u64,
@@ -71,6 +76,7 @@ struct FileEntry {
     drive_idx: u8,
 }
 
+// Application state enum to switch between different UI states
 enum AppState {
     Initializing,
     Scanning { count: u64, current_drive: String, start_time: Instant },
@@ -123,7 +129,7 @@ impl DeepSearchApp {
             tx_search,
         }
     }
-
+    // Start scanning drives in a separate thread to prevent UI blocking 
     fn start_scan(&mut self) {
         self.state = AppState::Scanning { 
             count: 0, 
@@ -547,6 +553,8 @@ fn resolve_path(entry: &FileEntry, data: &[FileEntry], drives: &[String]) -> Str
     }
 }
 
+
+// Open the given path in Windows Explorer, selecting the file if possible
 fn open_in_explorer(path: &str) {
     println!("Attempting to open: {}", path);
     
