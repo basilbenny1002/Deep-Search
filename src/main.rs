@@ -84,6 +84,7 @@ enum AppState {
     Error(String),
 }
 
+// Main application struct
 struct DeepSearchApp {
     state: AppState,
     file_data: Arc<Vec<FileEntry>>, // Read-only after scan
@@ -105,6 +106,7 @@ struct DeepSearchApp {
     tx_search: crossbeam_channel::Sender<(String, Vec<FileEntry>, Duration)>,
 }
 
+// --- APP LOGIC IMPLEMENTATION ---
 impl DeepSearchApp {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let (tx_progress, rx_progress) = crossbeam_channel::unbounded();
@@ -153,6 +155,7 @@ impl DeepSearchApp {
         });
     }
 
+    // Perform search asynchronously in a separate thread to prevent UI blocking based on current search_query
     fn perform_search(&mut self) {
         let query = self.search_query.clone();
         if query.is_empty() {
@@ -178,6 +181,8 @@ impl DeepSearchApp {
         });
     }
 }
+
+// GUI Implementation
 
 impl eframe::App for DeepSearchApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -345,7 +350,7 @@ fn main() -> eframe::Result<()> {
 }
 
 // --- WORKER LOGIC ---
-
+ // Get a list of fixed drives on the system
 fn get_drives() -> Vec<String> {
     let mut drives = Vec::new();
     let bitmask = unsafe { GetLogicalDrives() };
@@ -367,6 +372,7 @@ fn get_drives() -> Vec<String> {
     drives
 }
 
+// Scan all fixed drives and return collected FileEntry data
 fn scan_all_drives(
     tx_progress: crossbeam_channel::Sender<(u64, String)>
 ) -> Result<(Vec<FileEntry>, Vec<String>), String> {
