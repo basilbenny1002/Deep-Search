@@ -237,6 +237,9 @@ impl eframe::App for DeepSearchApp {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
+            // Disable text selection for labels to prevent cursor changing to I-beam
+            ui.style_mut().interaction.selectable_labels = false;
+
             match &self.state {
                 AppState::Initializing => {
                     ui.spinner();
@@ -337,10 +340,13 @@ impl eframe::App for DeepSearchApp {
                                     }
                                     
                                     // Force pointer cursor when hovering the row
-                                    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+                                    let _ = response.on_hover_cursor(egui::CursorIcon::PointingHand);
 
                                     // 3. Paint Background (Striping + Hover)
-                                    let bg_color = if response.hovered() {
+                                    // Use rect_contains_pointer to ensure highlight works even if text captures hover
+                                    let is_hovered = ui.rect_contains_pointer(rect);
+                                    
+                                    let bg_color = if is_hovered {
                                         Some(egui::Color32::from_rgb(40, 50, 70)) // Distinct Blue-ish hover
                                     } else if i % 2 == 1 {
                                         Some(egui::Color32::from_rgb(45, 45, 50)) // Lighter grey for striping
@@ -353,7 +359,7 @@ impl eframe::App for DeepSearchApp {
                                     }
 
                                     // 4. Draw Content
-                                    ui.allocate_ui_at_rect(rect, |ui| {
+                                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
                                         ui.horizontal_centered(|ui| {
                                             ui.add_space(10.0); // Padding
 
@@ -608,7 +614,7 @@ fn scan_drive(
         med.start_file_reference_number = unsafe { ptr::read(buffer.as_ptr() as *const u64) };
     }
 
-    unsafe { windows::Win32::Foundation::CloseHandle(handle) };
+    unsafe { let _ = windows::Win32::Foundation::CloseHandle(handle); };
 
     Ok(entries)
 }
