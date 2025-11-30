@@ -314,48 +314,71 @@ impl eframe::App for DeepSearchApp {
 
                     egui::ScrollArea::vertical().show_rows(
                         ui,
-                        20.0, // Estimated row height
+                        24.0, // Fixed row height
                         self.search_results.len(),
                         |ui, row_range| {
-                            egui::Grid::new("results_grid")
-                                .num_columns(1)
-                                .striped(true)
-                                .show(ui, |ui| {
-                                    for i in row_range {
-                                        if let Some(entry) = self.search_results.get(i) {
-                                            // Resolve path on the fly for visible rows
-                                            let full_path = resolve_path(entry, &self.file_data, &self.drives);
-                                            
-                                            ui.horizontal(|ui| {
-                                                // Force the row to take up the full available width
-                                                ui.set_min_width(ui.available_width());
+                            // Use manual layout for full control over rows
+                            ui.style_mut().spacing.item_spacing.y = 0.0;
 
-                                                // Column 1: Name (Fixed Width Container)
-                                                let name_width = 300.0;
-                                                ui.allocate_ui_with_layout(
-                                                    egui::vec2(name_width, 0.0),
-                                                    egui::Layout::left_to_right(egui::Align::Center),
-                                                    |ui| {
-                                                        ui.set_width(name_width);
-                                                        ui.add_space(10.0);
-                                                        let icon = if entry.is_dir { "📁" } else { "📄" };
-                                                        ui.label(icon);
-                                                        
-                                                        // Truncate name if it's too long to fit in the column
-                                                        let name_text = egui::RichText::new(&entry.name).color(egui::Color32::LIGHT_BLUE);
-                                                        if ui.add(egui::Label::new(name_text).truncate().sense(egui::Sense::click())).clicked() {
-                                                            open_in_explorer(&full_path);
-                                                        }
-                                                    }
-                                                );
+                            for i in row_range {
+                                if let Some(entry) = self.search_results.get(i) {
+                                    let full_path = resolve_path(entry, &self.file_data, &self.drives);
+                                    
+                                    // 1. Allocate the full row area
+                                    let row_height = 24.0;
+                                    let (rect, response) = ui.allocate_exact_size(
+                                        egui::vec2(ui.available_width(), row_height), 
+                                        egui::Sense::click()
+                                    );
 
-                                                // Column 2: Path
-                                                ui.label(egui::RichText::new(&full_path).size(10.0).color(egui::Color32::GRAY));
-                                            });
-                                            ui.end_row();
-                                        }
+                                    // 2. Handle Interaction (Click whole row to open)
+                                    if response.clicked() {
+                                        open_in_explorer(&full_path);
                                     }
-                                });
+                                    
+                                    // Force pointer cursor when hovering the row
+                                    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+
+                                    // 3. Paint Background (Striping + Hover)
+                                    let bg_color = if response.hovered() {
+                                        Some(egui::Color32::from_rgb(40, 50, 70)) // Distinct Blue-ish hover
+                                    } else if i % 2 == 1 {
+                                        Some(egui::Color32::from_rgb(45, 45, 50)) // Lighter grey for striping
+                                    } else {
+                                        None
+                                    };
+
+                                    if let Some(color) = bg_color {
+                                        ui.painter().rect_filled(rect, 0.0, color);
+                                    }
+
+                                    // 4. Draw Content
+                                    ui.allocate_ui_at_rect(rect, |ui| {
+                                        ui.horizontal_centered(|ui| {
+                                            ui.add_space(10.0); // Padding
+
+                                            // Icon
+                                            let icon = if entry.is_dir { "📁" } else { "📄" };
+                                            ui.label(icon);
+                                            
+                                            // Name Column (Fixed Width)
+                                            let name_width = 300.0;
+                                            ui.allocate_ui_with_layout(
+                                                egui::vec2(name_width, ui.available_height()),
+                                                egui::Layout::left_to_right(egui::Align::Center),
+                                                |ui| {
+                                                    let name_text = egui::RichText::new(&entry.name).color(egui::Color32::LIGHT_BLUE);
+                                                    ui.add(egui::Label::new(name_text).truncate());
+                                                }
+                                            );
+
+                                            // Path Column
+                                            let path_text = egui::RichText::new(&full_path).size(10.0).color(egui::Color32::GRAY);
+                                            ui.add(egui::Label::new(path_text).truncate());
+                                        });
+                                    });
+                                }
+                            }
                         },
                     );
                         
