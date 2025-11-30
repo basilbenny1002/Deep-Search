@@ -16,9 +16,10 @@ use windows::Win32::Storage::FileSystem::{
     CreateFileA, GetLogicalDrives, GetDriveTypeA, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 
+const DRIVE_REMOVABLE: u32 = 2;
 const DRIVE_FIXED: u32 = 3;
 use windows::Win32::System::IO::DeviceIoControl;
-use windows::Win32::System::Ioctl::{FSCTL_ENUM_USN_DATA, FSCTL_QUERY_USN_JOURNAL};
+use windows::Win32::System::Ioctl::{FSCTL_ENUM_USN_DATA, FSCTL_QUERY_USN_JOURNAL, FSCTL_CREATE_USN_JOURNAL};
 
 // --- RAW NTFS STRUCTURES --- for storing the values read from teh MFT table
 
@@ -31,6 +32,13 @@ struct UsnJournalData {
     next_usn: i64,
     lowest_valid_usn: i64,
     max_usn: i64,
+    maximum_size: u64,
+    allocation_delta: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Default)]
+struct CreateUsnJournalData {
     maximum_size: u64,
     allocation_delta: u64,
 }
@@ -89,6 +97,7 @@ struct DeepSearchApp {
     state: AppState,
     file_data: Arc<Vec<FileEntry>>, // Read-only after scan
     drives: Arc<Vec<String>>,
+    scan_errors: Vec<String>,
     search_query: String,
     search_results: Vec<FileEntry>,
     search_stats: Option<(usize, Duration)>,
@@ -96,8 +105,8 @@ struct DeepSearchApp {
     // Communication
     rx_progress: crossbeam_channel::Receiver<(u64, String)>,
     tx_progress: crossbeam_channel::Sender<(u64, String)>,
-    rx_data: crossbeam_channel::Receiver<(Vec<FileEntry>, Vec<String>)>,
-    tx_data: crossbeam_channel::Sender<(Vec<FileEntry>, Vec<String>)>,
+    rx_data: crossbeam_channel::Receiver<(Vec<FileEntry>, Vec<String>, Vec<String>)>,
+    tx_data: crossbeam_channel::Sender<(Vec<FileEntry>, Vec<String>, Vec<String>)>,
     rx_error: crossbeam_channel::Receiver<String>,
     tx_error: crossbeam_channel::Sender<String>,
     
@@ -118,6 +127,7 @@ impl DeepSearchApp {
             state: AppState::Initializing,
             file_data: Arc::new(Vec::new()),
             drives: Arc::new(Vec::new()),
+            scan_errors: Vec::new(),
             search_query: String::new(),
             search_results: Vec::new(),
             search_stats: None,
@@ -138,6 +148,7 @@ impl DeepSearchApp {
             current_drive: "Detecting drives...".to_string(),
             start_time: Instant::now() 
         };
+        self.scan_errors.clear();
 
         let tx_progress = self.tx_progress.clone();
         let tx_data = self.tx_data.clone();
@@ -145,8 +156,8 @@ impl DeepSearchApp {
 
         thread::spawn(move || {
             match scan_all_drives(tx_progress) {
-                Ok((data, drives)) => {
-                    let _ = tx_data.send((data, drives));
+                Ok((data, drives, errors)) => {
+                    let _ = tx_data.send((data, drives, errors));
                 }
                 Err(e) => {
                     let _ = tx_error.send(e);
@@ -200,9 +211,10 @@ impl eframe::App for DeepSearchApp {
                 *d = current_drive;
             }
         }
-        if let Ok((data, drives)) = self.rx_data.try_recv() {
+        if let Ok((data, drives, errors)) = self.rx_data.try_recv() {
             self.file_data = Arc::new(data);
             self.drives = Arc::new(drives);
+            self.scan_errors = errors;
             self.state = AppState::Ready;
         }
         if let Ok(err) = self.rx_error.try_recv() {
@@ -216,6 +228,7 @@ impl eframe::App for DeepSearchApp {
                 self.search_stats = Some((results.len(), duration));
                 self.search_results = results;
             }
+            
         }
 
         // Auto-start scan on first frame
@@ -254,6 +267,17 @@ impl eframe::App for DeepSearchApp {
                         ui.add_space(20.0);
                         ui.heading("Deep Search");
                     });
+                    
+                    if !self.scan_errors.is_empty() {
+                        ui.group(|ui| {
+                            ui.set_max_width(f32::INFINITY);
+                            ui.colored_label(egui::Color32::YELLOW, "⚠️ Scan Warnings:");
+                            for err in &self.scan_errors {
+                                ui.label(egui::RichText::new(err).size(11.0).color(egui::Color32::LIGHT_RED));
+                            }
+                        });
+                    }
+
                     ui.add_space(10.0);
                     
                     // Search Bar
@@ -364,7 +388,7 @@ fn get_drives() -> Vec<String> {
                 GetDriveTypeA(PCSTR(path.as_ptr())) 
             };
 
-            if drive_type == DRIVE_FIXED {
+            if drive_type == DRIVE_FIXED || drive_type == DRIVE_REMOVABLE {
                 drives.push(format!("{}:", drive_letter));
             }
         }
@@ -375,13 +399,14 @@ fn get_drives() -> Vec<String> {
 // Scan all fixed drives and return collected FileEntry data
 fn scan_all_drives(
     tx_progress: crossbeam_channel::Sender<(u64, String)>
-) -> Result<(Vec<FileEntry>, Vec<String>), String> {
+) -> Result<(Vec<FileEntry>, Vec<String>, Vec<String>), String> {
     let drives = get_drives();
     let mut all_entries = Vec::new();
+    let mut errors = Vec::new();
     let mut total_count = 0;
 
     if drives.is_empty() {
-        return Err("No fixed drives found.".to_string());
+        return Err("No fixed or removable drives found.".to_string());
     }
 
     for (idx, drive) in drives.iter().enumerate() {
@@ -391,7 +416,7 @@ fn scan_all_drives(
         // But if ALL fail, we might want to know.
         match scan_drive(drive, idx as u8, &tx_progress, &mut total_count) {
             Ok(entries) => all_entries.extend(entries),
-            Err(e) => eprintln!("Failed to scan {}: {}", drive, e),
+            Err(e) => errors.push(format!("Failed to scan {}: {}", drive, e)),
         }
     }
     
@@ -401,7 +426,7 @@ fn scan_all_drives(
         a.drive_idx.cmp(&b.drive_idx).then(a.id.cmp(&b.id))
     });
 
-    Ok((all_entries, drives))
+    Ok((all_entries, drives, errors))
 }
 
 fn scan_drive(
@@ -445,7 +470,45 @@ fn scan_drive(
     };
 
     if success.is_err() {
-        return Err(format!("Failed to query USN Journal on {}.", drive_letter));
+        // Try to create the journal if it doesn't exist
+        let mut create_data = CreateUsnJournalData {
+            maximum_size: 0,
+            allocation_delta: 0,
+        };
+        let create_success = unsafe {
+            DeviceIoControl(
+                handle,
+                FSCTL_CREATE_USN_JOURNAL,
+                Some(&mut create_data as *mut _ as *mut c_void),
+                size_of::<CreateUsnJournalData>() as u32,
+                None,
+                0,
+                Some(&mut bytes_returned),
+                None,
+            )
+        };
+
+        if create_success.is_err() {
+             return Err(format!("Failed to query or create USN Journal on {}. Is it NTFS?", drive_letter));
+        }
+
+        // Retry query
+        let success_retry = unsafe {
+            DeviceIoControl(
+                handle,
+                FSCTL_QUERY_USN_JOURNAL,
+                None,
+                0,
+                Some(&mut journal_data as *mut _ as *mut c_void),
+                size_of::<UsnJournalData>() as u32,
+                Some(&mut bytes_returned),
+                None,
+            )
+        };
+        
+        if success_retry.is_err() {
+             return Err(format!("Failed to query USN Journal on {} after creation attempt.", drive_letter));
+        }
     }
 
     let mut med = MftEnumData {
