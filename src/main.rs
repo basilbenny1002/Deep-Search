@@ -318,28 +318,40 @@ impl eframe::App for DeepSearchApp {
                         self.search_results.len(),
                         |ui, row_range| {
                             egui::Grid::new("results_grid")
-                                .num_columns(2)
-                                .spacing([10.0, 10.0])
+                                .num_columns(1)
                                 .striped(true)
-                                .min_col_width(200.0) // Ensure name column has some width
                                 .show(ui, |ui| {
                                     for i in row_range {
                                         if let Some(entry) = self.search_results.get(i) {
                                             // Resolve path on the fly for visible rows
                                             let full_path = resolve_path(entry, &self.file_data, &self.drives);
                                             
-                                            // Icon & Name
                                             ui.horizontal(|ui| {
-                                                ui.add_space(10.0);
-                                                let icon = if entry.is_dir { "📁" } else { "📄" };
-                                                ui.label(icon);
-                                                if ui.link(&entry.name).clicked() {
-                                                    open_in_explorer(&full_path);
-                                                }
-                                            });
+                                                // Force the row to take up the full available width
+                                                ui.set_min_width(ui.available_width());
 
-                                            // Path
-                                            ui.label(egui::RichText::new(&full_path).size(10.0).color(egui::Color32::GRAY));
+                                                // Column 1: Name (Fixed Width Container)
+                                                let name_width = 300.0;
+                                                ui.allocate_ui_with_layout(
+                                                    egui::vec2(name_width, 0.0),
+                                                    egui::Layout::left_to_right(egui::Align::Center),
+                                                    |ui| {
+                                                        ui.set_width(name_width);
+                                                        ui.add_space(10.0);
+                                                        let icon = if entry.is_dir { "📁" } else { "📄" };
+                                                        ui.label(icon);
+                                                        
+                                                        // Truncate name if it's too long to fit in the column
+                                                        let name_text = egui::RichText::new(&entry.name).color(egui::Color32::LIGHT_BLUE);
+                                                        if ui.add(egui::Label::new(name_text).truncate().sense(egui::Sense::click())).clicked() {
+                                                            open_in_explorer(&full_path);
+                                                        }
+                                                    }
+                                                );
+
+                                                // Column 2: Path
+                                                ui.label(egui::RichText::new(&full_path).size(10.0).color(egui::Color32::GRAY));
+                                            });
                                             ui.end_row();
                                         }
                                     }
