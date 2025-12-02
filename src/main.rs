@@ -752,25 +752,21 @@ fn open_in_explorer(path: &str) {
     println!("Attempting to open: {}", path);
     
     // Fix 4: Canonicalize + validate path
-    let full_path = std::fs::canonicalize(path).ok().filter(|p| {
-        // Basic sanity check: must start with a drive letter
-        let s = p.to_string_lossy();
-        s.len() >= 3 && s.chars().nth(1) == Some(':') && s.chars().nth(2) == Some('\\')
-    });
-
-    if full_path.is_none() || !full_path.as_ref().unwrap().exists() {
+    // We use std::path::Path to check existence, but we pass the original string to explorer
+    // because canonicalize() adds \\?\ prefix which explorer /select sometimes dislikes
+    if !std::path::Path::new(path).exists() {
         eprintln!("File does not exist or invalid path: {}", path);
         return;
     }
-    let full_path = full_path.unwrap();
-
-    let meta = std::fs::metadata(&full_path).ok();
-    if meta.is_none() { return; }
 
     // Fix 3: Use ShellExecuteW with /select
     // This is safer than Command::spawn because it avoids cmd.exe parsing issues
-    let path_str = full_path.to_string_lossy();
-    let params = format!("/select,{}", path_str);
+    // We convert the path to absolute if it isn't already, but keep it simple
+    let abs_path = std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path));
+    // Remove \\?\ prefix if present, as it can confuse some versions of Explorer with /select
+    let path_str = abs_path.to_string_lossy().replace("\\\\?\\", "");
+    
+    let params = format!("/select,\"{}\"", path_str);
     
     let op = "open\0".encode_utf16().collect::<Vec<u16>>();
     let file = "explorer.exe\0".encode_utf16().collect::<Vec<u16>>();
