@@ -3,23 +3,32 @@
 // NEcessary imports
 use eframe::egui;
 use rayon::prelude::*;
-use std::ffi::c_void;
+use std::ffi::{c_void, OsString};
 use std::mem::size_of;
-use std::os::windows::process::CommandExt;
+use std::os::windows::ffi::OsStrExt;
 use std::ptr;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
-use windows::core::PCSTR;
-use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE};
+use windows::core::{PCSTR, PCWSTR};
+use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, CloseHandle};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileA, GetLogicalDrives, GetDriveTypeA, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    CreateFileW, GetLogicalDrives, GetDriveTypeA, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
+use windows::Win32::UI::Shell::ShellExecuteW;
+use windows::Win32::UI::WindowsAndMessaging::SW_SHOW;
 
 const DRIVE_REMOVABLE: u32 = 2;
 const DRIVE_FIXED: u32 = 3;
 use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::System::Ioctl::{FSCTL_ENUM_USN_DATA, FSCTL_QUERY_USN_JOURNAL, FSCTL_CREATE_USN_JOURNAL};
+
+struct SafeHandle(HANDLE);
+impl Drop for SafeHandle {
+    fn drop(&mut self) {
+        unsafe { let _ = CloseHandle(self.0); }
+    }
+}
 
 // --- RAW NTFS STRUCTURES --- for storing the values read from teh MFT table
 
@@ -69,6 +78,8 @@ struct UsnRecordHeader {
     file_name_length: u16,
     file_name_offset: u16,
 }
+
+const USN_RECORD_HEADER_SIZE: usize = 60;
 
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x00000010; // A bitmask indicating a directory
 
@@ -269,6 +280,8 @@ impl eframe::App for DeepSearchApp {
                     ui.vertical_centered(|ui| {
                         ui.add_space(20.0);
                         ui.heading("Deep Search");
+                        ui.add_space(5.0);
+                        ui.label(egui::RichText::new("Shows hidden/system files").size(10.0).color(egui::Color32::GRAY));
                     });
                     
                     if !self.scan_errors.is_empty() {
@@ -493,11 +506,13 @@ fn scan_drive(
     tx: &crossbeam_channel::Sender<(u64, String)>,
     total_count: &mut u64
 ) -> Result<Vec<FileEntry>, String> {
-    let volume_path = format!("\\\\.\\{}\0", drive_letter);
+    let volume_path_str = format!("\\\\.\\{}", drive_letter);
+    let volume_path: Vec<u16> = OsString::from(&volume_path_str).encode_wide().chain(Some(0)).collect();
     
-    let handle = unsafe {
-        CreateFileA(
-            PCSTR(volume_path.as_ptr()),
+    // Initial open with WRITE access to create journal if needed
+    let handle_raw = unsafe {
+        CreateFileW(
+            PCWSTR(volume_path.as_ptr()),
             GENERIC_READ.0 | GENERIC_WRITE.0, 
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             None,
@@ -507,16 +522,16 @@ fn scan_drive(
         )
     };
 
-    if handle == Ok(INVALID_HANDLE_VALUE) || handle.is_err() {
+    if handle_raw == Ok(INVALID_HANDLE_VALUE) || handle_raw.is_err() {
         return Err(format!("Access Denied to {}. Run as Administrator.", drive_letter));
     }
-    let handle = handle.unwrap();
+    let mut handle = SafeHandle(handle_raw.unwrap());
 
     let mut journal_data = UsnJournalData::default();
     let mut bytes_returned = 0u32;
     let success = unsafe {
         DeviceIoControl(
-            handle,
+            handle.0,
             FSCTL_QUERY_USN_JOURNAL,
             None,
             0,
@@ -535,7 +550,7 @@ fn scan_drive(
         };
         let create_success = unsafe {
             DeviceIoControl(
-                handle,
+                handle.0,
                 FSCTL_CREATE_USN_JOURNAL,
                 Some(&mut create_data as *mut _ as *mut c_void),
                 size_of::<CreateUsnJournalData>() as u32,
@@ -550,10 +565,30 @@ fn scan_drive(
              return Err(format!("Failed to query or create USN Journal on {}. Is it NTFS?", drive_letter));
         }
 
-        // Retry query
+        // Fix 5: Drop write access - Reopen with GENERIC_READ only
+        drop(handle); // Close current handle
+        
+        let handle_read_raw = unsafe {
+            CreateFileW(
+                PCWSTR(volume_path.as_ptr()),
+                GENERIC_READ.0, // Read only
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAGS_AND_ATTRIBUTES(0),
+                HANDLE(ptr::null_mut()),
+            )
+        };
+        
+        if handle_read_raw == Ok(INVALID_HANDLE_VALUE) || handle_read_raw.is_err() {
+            return Err(format!("Failed to reopen {} for reading.", drive_letter));
+        }
+        handle = SafeHandle(handle_read_raw.unwrap());
+
+        // Retry query with new handle
         let success_retry = unsafe {
             DeviceIoControl(
-                handle,
+                handle.0,
                 FSCTL_QUERY_USN_JOURNAL,
                 None,
                 0,
@@ -579,9 +614,14 @@ fn scan_drive(
     let mut entries = Vec::with_capacity(100_000); 
 
     loop {
+        // Fix 8: Cap total entries
+        if entries.len() > 10_000_000 {
+            return Err("Too many files — skipping rest for safety".to_string());
+        }
+
         let success = unsafe {
             DeviceIoControl(
-                handle,
+                handle.0,
                 FSCTL_ENUM_USN_DATA,
                 Some(&mut med as *mut _ as *mut c_void),
                 size_of::<MftEnumData>() as u32,
@@ -596,18 +636,43 @@ fn scan_drive(
 
         let mut offset = 8; 
         while offset < bytes_returned as usize {
-            let p_record = unsafe { &*(buffer.as_ptr().add(offset) as *const UsnRecordHeader) };
-            let fname_len = p_record.file_name_length as usize;
+            // Fix 1: Safe parsing
+            if offset + USN_RECORD_HEADER_SIZE > bytes_returned as usize { break; }
             
+            let p_record = unsafe { ptr::read_unaligned(buffer.as_ptr().add(offset) as *const UsnRecordHeader) };
+            let rec_len = p_record.record_length as usize;
+            
+            if rec_len < USN_RECORD_HEADER_SIZE || rec_len == 0 || offset + rec_len > bytes_returned as usize { 
+                // If record length is invalid, we can't trust the rest of the buffer
+                break; 
+            }
+
+            let fname_len = p_record.file_name_length as usize;
+            let fname_off = p_record.file_name_offset as usize;
+
             if fname_len > 0 {
+                // Validate filename offset and length
+                // Use constant 60 because size_of struct might include padding (64 bytes)
+                if fname_len % 2 != 0 || fname_off < USN_RECORD_HEADER_SIZE || fname_off + fname_len > rec_len {
+                    offset += rec_len;
+                    continue;
+                }
+
                 let name_slice = unsafe {
                     std::slice::from_raw_parts(
-                        buffer.as_ptr().add(offset + p_record.file_name_offset as usize) as *const u16,
+                        buffer.as_ptr().add(offset + fname_off) as *const u16,
                         fname_len / 2,
                     )
                 };
                 
                 let name = String::from_utf16_lossy(name_slice);
+                
+                // Fix 2: Block malicious filenames
+                if name.contains(':') || name.contains("::") || name.ends_with(".lnk") || (name.contains('{') && name.contains('}')) || name.contains("\\\\?\\") {
+                    offset += rec_len;
+                    continue;
+                }
+
                 let is_dir = (p_record.file_attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
 
                 entries.push(FileEntry {
@@ -620,7 +685,7 @@ fn scan_drive(
 
                 *total_count += 1;
             }
-            offset += p_record.record_length as usize;
+            offset += rec_len;
         }
 
         // Report progress every ~2k files
@@ -628,10 +693,11 @@ fn scan_drive(
             let _ = tx.send((*total_count, format!("Scanning {}...", drive_letter)));
         }
 
-        med.start_file_reference_number = unsafe { ptr::read(buffer.as_ptr() as *const u64) };
+        if bytes_returned < 8 { break; }
+        med.start_file_reference_number = unsafe { ptr::read_unaligned(buffer.as_ptr() as *const u64) };
     }
 
-    unsafe { let _ = windows::Win32::Foundation::CloseHandle(handle); };
+    // Handle is closed automatically by SafeHandle
 
     Ok(entries)
 }
@@ -685,14 +751,39 @@ fn resolve_path(entry: &FileEntry, data: &[FileEntry], drives: &[String]) -> Str
 fn open_in_explorer(path: &str) {
     println!("Attempting to open: {}", path);
     
-    if !std::path::Path::new(path).exists() {
-        eprintln!("File does not exist: {}", path);
+    // Fix 4: Canonicalize + validate path
+    let full_path = std::fs::canonicalize(path).ok().filter(|p| {
+        // Basic sanity check: must start with a drive letter
+        let s = p.to_string_lossy();
+        s.len() >= 3 && s.chars().nth(1) == Some(':') && s.chars().nth(2) == Some('\\')
+    });
+
+    if full_path.is_none() || !full_path.as_ref().unwrap().exists() {
+        eprintln!("File does not exist or invalid path: {}", path);
         return;
     }
+    let full_path = full_path.unwrap();
 
-    // Use CommandExt::raw_arg to pass the argument exactly as is
-    // This avoids Rust's automatic quoting which can confuse explorer's /select switch
-    let _ = std::process::Command::new("explorer")
-        .raw_arg(format!("/select,\"{}\"", path))
-        .spawn();
+    let meta = std::fs::metadata(&full_path).ok();
+    if meta.is_none() { return; }
+
+    // Fix 3: Use ShellExecuteW with /select
+    // This is safer than Command::spawn because it avoids cmd.exe parsing issues
+    let path_str = full_path.to_string_lossy();
+    let params = format!("/select,{}", path_str);
+    
+    let op = "open\0".encode_utf16().collect::<Vec<u16>>();
+    let file = "explorer.exe\0".encode_utf16().collect::<Vec<u16>>();
+    let params_wide: Vec<u16> = OsString::from(&params).encode_wide().chain(Some(0)).collect();
+
+    unsafe {
+        ShellExecuteW(
+            None,
+            PCWSTR(op.as_ptr()),
+            PCWSTR(file.as_ptr()),
+            PCWSTR(params_wide.as_ptr()),
+            None,
+            SW_SHOW
+        );
+    }
 }
