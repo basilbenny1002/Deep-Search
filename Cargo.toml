@@ -8,6 +8,7 @@ eframe = "0.29.1"
 egui = "0.29.1"
 rayon = "1.10.0"
 crossbeam-channel = "0.5.13"
+image = { version = "0.25", default-features = false, features = ["ico", "png"] }
 
 [dependencies.windows]
 version = "0.58.0"

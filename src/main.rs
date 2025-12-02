@@ -400,10 +400,27 @@ impl eframe::App for DeepSearchApp {
     }
 }
 
+fn load_icon() -> egui::IconData {
+    let (icon_rgba, icon_width, icon_height) = {
+        let icon = image::load_from_memory(include_bytes!("../assets/deep_search.ico"))
+            .expect("Failed to open icon path")
+            .into_rgba8();
+        let (width, height) = icon.dimensions();
+        (icon.into_raw(), width, height)
+    };
+    
+    egui::IconData {
+        rgba: icon_rgba,
+        width: icon_width,
+        height: icon_height,
+    }
+}
+
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([800.0, 600.0]),
+            .with_inner_size([800.0, 600.0])
+            .with_icon(load_icon()),
         vsync: true, // Enable VSync to fix flickering
         ..Default::default()
     };
