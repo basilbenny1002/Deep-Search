@@ -5,6 +5,8 @@ fn main() {
         res.set("FileDescription", "Deep Search");
         res.set("ProductName", "Deep Search");
         res.set("OriginalFilename", "Deep Search.exe");
+        res.set("FileVersion", "1.0.0.0");
+        res.set("ProductVersion", "1.0.0.0");
         res.set_manifest(r#"
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
 <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
